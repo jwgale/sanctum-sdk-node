@@ -3,11 +3,10 @@
 [![npm version](https://img.shields.io/npm/v/sanctum-ai.svg)](https://www.npmjs.com/package/sanctum-ai)
 [![Node.js](https://img.shields.io/badge/node-18%2B-brightgreen.svg)](https://nodejs.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![CI](https://github.com/jwgale/sanctum-sdk-node/actions/workflows/ci.yml/badge.svg)](https://github.com/jwgale/sanctum-sdk-node/actions/workflows/ci.yml)
 
-> Part of the [SanctumAI](https://github.com/jwgale/sanctum) ecosystem — secure credential management for AI agents.
+Node.js/TypeScript SDK for [SanctumAI](https://github.com/SanctumSec/sanctum) — a local-first credential vault for AI agents.
 
-TypeScript/Node.js SDK for interacting with a SanctumAI vault. Supports Unix sockets and TCP, Ed25519 authentication, automatic lease tracking, and the **use-not-retrieve** pattern.
+Your agent connects to the SanctumAI daemon over JSON-RPC, authenticates with Ed25519 keys, and accesses credentials without ever holding secrets in memory.
 
 ## Installation
 
@@ -23,67 +22,178 @@ Requires **Node.js 18+**.
 import { SanctumClient } from "sanctum-ai";
 
 const client = new SanctumClient("my-agent");
-await client.connect();
+await client.connect(); // connects to daemon and authenticates
 
-// List available credentials
-const creds = await client.list();
-for (const c of creds) {
-  console.log(`  ${c.path} (tags: ${c.tags.join(", ")})`);
-}
+// Use a credential without ever seeing it
+const response = await client.use("openai/api-key", "http_request", {
+  method: "POST",
+  url: "https://api.openai.com/v1/chat/completions",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({
+    model: "gpt-4",
+    messages: [{ role: "user", content: "Hello" }],
+  }),
+  header_type: "bearer",
+});
 
-// Retrieve a credential (lease auto-tracked, released on close)
-const apiKey: string = await client.retrieve("openai/api_key");
-console.log(`Key starts with: ${apiKey.slice(0, 8)}...`);
-
-// Use-not-retrieve — credential never leaves the vault
-const result = await client.use("openai/api_key", "http_header");
-// result.header → "Authorization: Bearer sk-..."
+console.log(response.status); // 200
+console.log(response.body);   // completion result
 
 await client.close();
+```
+
+The agent never sees the API key. The vault injects credentials and proxies the request.
+
+## Use Don't Retrieve
+
+This is the core pattern. Instead of retrieving a secret and using it yourself, you tell the vault *what you want to do* and it handles the credential for you.
+
+### Proxy an HTTP Request
+
+The vault injects the credential into the request, makes the call, and returns the response. Your agent never touches the secret.
+
+```typescript
+const result = await client.use("openai/api-key", "http_request", {
+  method: "POST",
+  url: "https://api.openai.com/v1/chat/completions",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({
+    model: "gpt-4",
+    messages: [{ role: "user", content: "Hello" }],
+  }),
+  header_type: "bearer", // bearer | api_key | basic | custom
+});
+// result => { status: 200, headers: {...}, body: "..." }
+```
+
+### Get an HTTP Header
+
+If you need to make the request yourself but want the vault to construct the auth header:
+
+```typescript
+const result = await client.use("github/token", "http_header", {
+  header_type: "bearer",
+});
+// result => { header_name: "Authorization", header_value: "Bearer ghp_..." }
+```
+
+### Sign Data (HMAC)
+
+```typescript
+const result = await client.use("webhook/secret", "sign", {
+  algorithm: "hmac-sha256",
+  data: "payload-to-sign",
+});
+// result => { signature: "base64-encoded-signature" }
+```
+
+### Encrypt / Decrypt
+
+```typescript
+const encrypted = await client.use("encryption/key", "encrypt", {
+  plaintext: "sensitive data",
+});
+// encrypted => { ciphertext: "..." }
+
+const decrypted = await client.use("encryption/key", "decrypt", {
+  ciphertext: encrypted.ciphertext,
+});
+// decrypted => { plaintext: "sensitive data" }
 ```
 
 ## Connecting
 
 ```typescript
-// Unix socket (default: ~/.sanctum/vault.sock)
+// Default: Unix socket at ~/.sanctum/vault.sock
 const client = new SanctumClient("my-agent");
 await client.connect();
 
 // Custom socket path
 await client.connect("/tmp/sanctum.sock");
 
-// TCP connection
-await client.connect({ host: "127.0.0.1", port: 8200 });
+// TCP (e.g. default daemon port 7600)
+await client.connect({ host: "127.0.0.1", port: 7600 });
 
-// Or via constructor options
-const client = new SanctumClient("my-agent", { host: "127.0.0.1", port: 8200 });
+// Or via constructor
+const client = new SanctumClient("my-agent", {
+  host: "127.0.0.1",
+  port: 7600,
+});
 await client.connect();
 ```
 
-## Use-Not-Retrieve
+Authentication happens automatically during `connect()`. The SDK reads your agent's Ed25519 key from `~/.sanctum/keys/{agent_name}.key` and performs a challenge-response handshake with the daemon.
 
-The **use-not-retrieve** pattern lets agents perform operations that require a credential without ever exposing the secret to the agent process. The vault executes the operation server-side and returns only the result.
+## Retrieving Credentials
+
+When you need the raw credential value (e.g. for SDKs that require it), use `retrieve()`. The vault tracks access with a lease.
 
 ```typescript
-// Sign a request — private key never leaves the vault
-const signed = await client.use("signing/key", "sign_payload", {
-  payload: "data-to-sign",
-});
+const apiKey: string = await client.retrieve("anthropic/api-key");
+// use apiKey with the Anthropic SDK...
 
-// Inject as HTTP header — agent never sees the raw token
-const header = await client.use("openai/api_key", "http_header");
-
-// Encrypt data — encryption key stays in the vault
-const encrypted = await client.use("encryption/key", "encrypt", {
-  plaintext: "sensitive data",
-});
+// Retrieve with a TTL (seconds) — lease auto-expires
+const shortLived = await client.retrieve("anthropic/api-key", 300);
 ```
 
-This is the recommended pattern for production agents. Secrets never exist in agent memory, minimizing blast radius if an agent is compromised.
+Prefer [`use()`](#use-dont-retrieve) when possible. It keeps secrets out of agent memory entirely.
+
+## Listing Credentials
+
+```typescript
+const credentials = await client.list();
+for (const cred of credentials) {
+  console.log(cred.path);
+}
+```
+
+## Releasing Leases
+
+Leases are released automatically when you call `close()`. To release early:
+
+```typescript
+// client.retrieve() returns the value; lease is tracked internally
+const value = await client.retrieve("openai/api-key");
+
+// Release all leases and disconnect
+await client.close();
+```
+
+## API Reference
+
+### `new SanctumClient(agentName, opts?)`
+
+| Option | Type | Description |
+|---|---|---|
+| `socketPath` | `string` | Unix socket path (default: `~/.sanctum/vault.sock`) |
+| `host` | `string` | TCP host (alternative to socket) |
+| `port` | `number` | TCP port (default daemon port: `7600`) |
+| `keyPath` | `string` | Path to Ed25519 key file (default: `~/.sanctum/keys/{agentName}.key`) |
+
+### Methods
+
+| Method | Returns | Description |
+|---|---|---|
+| `connect(target?)` | `Promise<this>` | Connect to daemon and authenticate |
+| `use(path, operation, params?)` | `Promise<UseResult>` | **Use a credential without retrieving it** |
+| `retrieve(path, ttl?)` | `Promise<string>` | Retrieve credential value (lease auto-tracked) |
+| `list()` | `Promise<CredentialEntry[]>` | List accessible credentials |
+| `releaseLease(leaseId)` | `Promise<void>` | Release a credential lease early |
+| `close()` | `Promise<void>` | Release all leases and disconnect |
+
+### `use()` Operations
+
+| Operation | Description | Key Params |
+|---|---|---|
+| `http_request` | Proxy an HTTP request through the vault | `method`, `url`, `headers`, `body`, `header_type` |
+| `http_header` | Get an auth header without making the request | `header_type` |
+| `sign` | Sign data with HMAC | `algorithm`, `data` |
+| `encrypt` | Encrypt data | `plaintext` |
+| `decrypt` | Decrypt data | `ciphertext` |
 
 ## Error Handling
 
-All errors inherit from `VaultError` and carry structured context:
+All errors extend `VaultError` with structured context:
 
 ```typescript
 import { SanctumClient } from "sanctum-ai";
@@ -94,15 +204,14 @@ import {
   CredentialNotFound,
   VaultLocked,
   LeaseExpired,
-  RateLimited,
-  SessionExpired,
 } from "sanctum-ai/errors";
 
-const client = new SanctumClient("my-agent");
-await client.connect();
-
 try {
-  const secret = await client.retrieve("openai/api_key");
+  const result = await client.use("openai/api-key", "http_request", {
+    method: "GET",
+    url: "https://api.openai.com/v1/models",
+    header_type: "bearer",
+  });
 } catch (e) {
   if (e instanceof AccessDenied) {
     console.error(`No access: ${e.detail}`);
@@ -112,77 +221,36 @@ try {
   } else if (e instanceof AuthError) {
     console.error("Authentication failed — check your Ed25519 key");
   } else if (e instanceof VaultLocked) {
-    console.error("Vault is sealed — an operator needs to unseal it");
+    console.error("Vault is locked — unlock it first");
   } else if (e instanceof VaultError) {
     console.error(`[${e.code}] ${e.detail}`);
-    if (e.docsUrl) console.error(`Docs: ${e.docsUrl}`);
   }
-} finally {
-  await client.close();
 }
 ```
 
-### Error Reference
+### Error Types
 
-| Class | Code | Description |
+| Class | Code | When |
 |---|---|---|
-| `VaultError` | — | Base error |
-| `AuthError` | `AUTH_FAILED` | Authentication failed |
-| `AccessDenied` | `ACCESS_DENIED` | Insufficient permissions |
-| `CredentialNotFound` | `CREDENTIAL_NOT_FOUND` | Path doesn't exist |
-| `VaultLocked` | `VAULT_LOCKED` | Vault is sealed |
-| `LeaseExpired` | `LEASE_EXPIRED` | Lease timed out |
+| `VaultError` | — | Base error for all vault errors |
+| `AuthError` | `AUTH_FAILED` | Ed25519 authentication failed |
+| `AccessDenied` | `ACCESS_DENIED` | Agent lacks permission for this credential |
+| `CredentialNotFound` | `CREDENTIAL_NOT_FOUND` | Credential path doesn't exist |
+| `VaultLocked` | `VAULT_LOCKED` | Vault is sealed/locked |
+| `LeaseExpired` | `LEASE_EXPIRED` | Credential lease timed out |
 | `RateLimited` | `RATE_LIMITED` | Too many requests |
-| `SessionExpired` | `SESSION_EXPIRED` | Re-authenticate needed |
+| `SessionExpired` | `SESSION_EXPIRED` | Session expired, re-authenticate |
 
 All errors carry `.code`, `.detail`, `.suggestion`, `.docsUrl`, and `.context`.
 
-## API Reference
-
-### `new SanctumClient(agentName, opts?)`
-
-| Option | Description |
-|---|---|
-| `socketPath` | Unix socket path (default: `~/.sanctum/vault.sock`) |
-| `host` / `port` | TCP connection (alternative to socket) |
-| `keyPath` | Path to Ed25519 key file (default: `~/.sanctum/keys/{agentName}.key`) |
-
-### Methods
-
-| Method | Returns | Description |
-|---|---|---|
-| `connect(target?)` | `Promise<this>` | Connect and authenticate |
-| `retrieve(path, ttl?)` | `Promise<string>` | Retrieve credential (lease auto-tracked) |
-| `list()` | `Promise<CredentialEntry[]>` | List accessible credentials |
-| `releaseLease(leaseId)` | `Promise<void>` | Release a credential lease |
-| `use(path, operation, params?)` | `Promise<UseResult>` | Use-not-retrieve operation |
-| `close()` | `Promise<void>` | Release all leases and disconnect |
-
-## Protocol
-
-JSON-RPC over Unix sockets or TCP with 4-byte big-endian length-prefix framing. Ed25519 challenge-response authentication.
-
 ## Contributing
 
-Contributions are welcome! Please:
-
 1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/my-feature`)
+2. Create a feature branch
 3. Write tests for new functionality
 4. Ensure all tests pass (`npm test`)
 5. Submit a pull request
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for detailed guidelines.
-
 ## License
 
 MIT — see [LICENSE](LICENSE).
-
-## Links
-
-- 🏠 **Main project:** [github.com/jwgale/sanctum](https://github.com/jwgale/sanctum)
-- 🌐 **Website:** [sanctumai.dev](https://sanctumai.dev)
-- 🐍 **Python SDK:** [sanctum-sdk-python](https://github.com/jwgale/sanctum-sdk-python)
-- 🦀 **Rust SDK:** [sanctum-sdk-rust](https://github.com/jwgale/sanctum-sdk-rust)
-- 🐹 **Go SDK:** [sanctum-sdk-go](https://github.com/jwgale/sanctum-sdk-go)
-- 🐛 **Issues:** [github.com/jwgale/sanctum-sdk-node/issues](https://github.com/jwgale/sanctum-sdk-node/issues)

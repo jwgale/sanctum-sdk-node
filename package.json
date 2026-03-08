@@ -1,6 +1,6 @@
 {
   "name": "sanctum-ai",
-  "version": "0.1.0",
+  "version": "0.4.0",
   "description": "Node.js/TypeScript SDK for SanctumAI — secure credential management for AI agents",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
