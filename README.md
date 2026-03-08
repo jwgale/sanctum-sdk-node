@@ -1,3 +1,5 @@
+> **AI Agents:** See [AGENTS.md](AGENTS.md) for machine-readable integration docs.
+
 # SanctumAI Node.js SDK
 
 [![npm version](https://img.shields.io/npm/v/sanctum-ai.svg)](https://www.npmjs.com/package/sanctum-ai)
